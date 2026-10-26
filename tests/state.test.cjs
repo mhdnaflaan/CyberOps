@@ -1,0 +1,56 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const store = new Map();
+const context = {
+  window: { MISSIONS: [{ id: 'net-01', path: 'networking', requires: [] }] },
+  localStorage: { getItem: k => store.has(k) ? store.get(k) : null, setItem: (k,v) => store.set(k,v), removeItem: k => store.delete(k) },
+  Date, Number, JSON, Object, Math, Array
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('js/state.js','utf8'), context);
+const G = context.window.Game;
+G.create({ username: 'TestOperative', avatarId: 'av-1', careerPath: 'networking' });
+assert.equal(G.get().reputation, 50);
+assert.equal(G.getRelationship('Dana'), 0);
+let result = G.recordDecision('net-01','communicate');
+assert.equal(result.ok, true);
+assert.equal(G.getRelationship('Dana'), 1);
+assert.equal(G.getRelationship('Alex'), 1);
+assert.equal(G.getCampaignState().lastDecision, 'joint-response');
+result = G.recordDecision('net-01','restore_fast');
+assert.equal(result.ok, false, 'same mission decision must not be farmable');
+assert.equal(G.getRelationship('Dana'), 1, 'duplicate choice must not change trust');
+G.save();
+const savedProfile = store.get('cyberops.premium');
+G.reset();
+store.set('cyberops.premium', savedProfile);
+assert.equal(G.load(), true);
+assert.equal(G.getCampaignState().decisions['net-01'].choice, 'communicate');
+assert.equal(G.getRelationship('Nadia'), 2);
+const mission = context.window.MISSIONS[0];
+const award = G.completeMission(mission, { score: 95, xp: 100, challengeAwarded: true, challengeLabel: 'Evidence before conclusions', bonus: 5 });
+assert.equal(award.first, true);
+assert.equal(G.get().completed['net-01'].challengeAwarded, true);
+assert.equal(G.get().history[0].challengeLabel, 'Evidence before conclusions');
+G.save();
+const persisted = store.get('cyberops.premium');
+G.reset(); store.set('cyberops.premium', persisted); assert.equal(G.load(), true);
+assert.equal(G.get().history[0].bonus, 5, 'adaptive challenge bonus must persist');
+console.log('State tests passed: persistence, relationships, campaign flag, anti-farming, assessment history.');
+const enterprise = G.getEnterpriseState();
+assert.equal(enterprise.services.intranet, 'up', 'new profiles receive default enterprise services');
+const stopped = G.setEnterpriseService('intranet', 'down');
+assert.equal(stopped.ok, true);
+assert.equal(G.verifyEnterpriseService('intranet').ok, false, 'verification fails while service is down');
+assert.equal(G.setEnterpriseService('intranet', 'up').ok, true);
+assert.equal(G.verifyEnterpriseService('intranet').ok, true, 'verification passes after simulated recovery');
+const change = G.addChangeRecord('restored intranet after test incident');
+assert.equal(change.id, 'CHG-101');
+assert.ok(G.getEnterpriseState().events.length >= 4, 'service changes and verification should create audit events');
+G.save();
+const enterpriseSave = store.get('cyberops.premium');
+G.reset(); store.set('cyberops.premium', enterpriseSave); assert.equal(G.load(), true);
+assert.equal(G.getEnterpriseState().services.intranet, 'up', 'enterprise service state persists');
+assert.equal(G.getEnterpriseState().changes[0].id, 'CHG-101', 'change records persist');
+console.log('Enterprise tests passed: service lifecycle, verification, audit events, change records and persistence.');

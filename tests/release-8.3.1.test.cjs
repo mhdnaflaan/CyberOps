@@ -1,0 +1,10 @@
+const fs=require('fs'),assert=require('assert');
+const app=fs.readFileSync(__dirname+'/../js/app.js','utf8');
+const css=fs.readFileSync(__dirname+'/../styles.css','utf8');
+assert(app.includes('curriculum-search'),'curriculum search control wired');
+assert(app.includes('data-lesson-search'),'lesson cards index title and concepts');
+assert(app.includes('cyberops-learning-record.json'),'learning record export');
+assert(app.includes('No lessons match that search'),'empty search state');
+assert(css.includes('.curriculum-card[hidden]'),'filtered cards are actually hidden');
+assert(css.includes('@media(max-width:620px){.curriculum-tools'),'mobile layout rules');
+console.log('8.3.1 release tests passed: lesson search, empty state, learning record export and responsive styles.');

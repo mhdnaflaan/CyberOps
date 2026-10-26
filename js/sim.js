@@ -1,468 +1,260 @@
-/* ============================================================
-   sim.js — deterministic, fictional network simulation.
-   Nothing here touches a real network.
-   ============================================================ */
 window.Sim = (function () {
   'use strict';
-
-  /* ---------- IP math ---------- */
-  function isValidIp(ip) {
-    if (typeof ip !== 'string') return false;
-    const p = ip.trim().split('.');
-    if (p.length !== 4) return false;
-    return p.every(s => /^\d{1,3}$/.test(s) && Number(s) >= 0 && Number(s) <= 255);
-  }
-  function ipToInt(ip) {
-    const p = ip.trim().split('.').map(Number);
-    return ((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3];
-  }
-  function intToIp(n) {
-    n = n >>> 0;
-    return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.');
-  }
-  function sameSubnet(ip, mask, other) {
-    if (!isValidIp(ip) || !isValidIp(mask) || !isValidIp(other)) return false;
-    const m = ipToInt(mask);
-    return ((ipToInt(ip) & m) >>> 0) === ((ipToInt(other) & m) >>> 0);
-  }
-  function networkOf(ip, mask) {
-    if (!isValidIp(ip) || !isValidIp(mask)) return '—';
-    return intToIp((ipToInt(ip) & ipToInt(mask)) >>> 0);
-  }
-
-  /* ---------- device helpers ---------- */
-  function iface(dev, name) { return dev && dev.ifaces ? dev.ifaces[name] : null; }
-  function ifaceNames(dev) { return dev && dev.ifaces ? Object.keys(dev.ifaces) : []; }
-  function primaryIf(dev) { const n = ifaceNames(dev); return n.length ? dev.ifaces[n[0]] : null; }
+  function isValidIp(ip) { return typeof ip === 'string' && /^(\d{1,3}\.){3}\d{1,3}$/.test(ip) && ip.split('.').every(o => parseInt(o) <= 255); }
+  function ipToInt(ip) { return ip.split('.').reduce((a, o) => (a << 8) + parseInt(o), 0) >>> 0; }
+  function sameSubnet(ip, mask, other) { return isValidIp(ip) && isValidIp(mask) && isValidIp(other) && (ipToInt(ip) & ipToInt(mask)) === (ipToInt(other) & ipToInt(mask)); }
 
   function findDeviceByIp(net, ip) {
+    if (!net || !net.devices) return null;
     for (const id in net.devices) {
-      const d = net.devices[id];
-      for (const n of ifaceNames(d)) {
-        const i = d.ifaces[n];
-        if (i.ip && i.ip === ip) return { dev: d, name: n, iface: i };
+      for (const n in net.devices[id].ifaces) {
+        if (net.devices[id].ifaces[n].ip === ip) return { dev: net.devices[id], iface: net.devices[id].ifaces[n] };
       }
     }
     return null;
   }
 
-  function linkIsUp(net, l) {
-    const a = net.devices[l.a], b = net.devices[l.b];
-    if (!a || !b) return false;
-    const ai = iface(a, l.aIf), bi = iface(b, l.bIf);
-    return !!(ai && bi && ai.up && bi.up);
-  }
-
-  /** BFS over up-links. Returns array of device ids or null. */
-  function pathExists(net, fromId, toId) {
-    if (fromId === toId) return [fromId];
-    const adj = {};
-    net.links.forEach(l => {
-      if (!linkIsUp(net, l)) return;
-      (adj[l.a] = adj[l.a] || []).push(l.b);
-      (adj[l.b] = adj[l.b] || []).push(l.a);
-    });
-    const prev = { [fromId]: null };
-    const q = [fromId];
-    while (q.length) {
-      const cur = q.shift();
-      if (cur === toId) {
-        const path = [];
-        let c = cur;
-        while (c !== null) { path.unshift(c); c = prev[c]; }
-        return path;
-      }
-      (adj[cur] || []).forEach(nx => {
-        if (!(nx in prev)) { prev[nx] = cur; q.push(nx); }
-      });
-    }
-    return null;
-  }
-
-  /**
-   * Core reachability. Returns
-   * { ok, reason, latency, hops:[deviceId], via:'local'|'gateway' }
-   */
-  function reach(net, srcId, dstIp) {
-    const src = net.devices[srcId];
-    if (!src) return { ok: false, reason: 'Unknown source device.' };
-    const si = primaryIf(src);
-    if (!si) return { ok: false, reason: 'Device has no network interface.' };
-    if (!si.up) return { ok: false, reason: 'Media disconnected (interface is administratively down).' };
-    if (!si.ip) return { ok: false, reason: 'No IP address is configured on this interface.' };
-    if (!isValidIp(si.ip)) return { ok: false, reason: 'The configured IP address is not valid.' };
-    if (!isValidIp(si.mask)) return { ok: false, reason: 'The configured subnet mask is not valid.' };
-    if (!isValidIp(dstIp)) return { ok: false, reason: 'Invalid destination address.' };
-
-    const dst = findDeviceByIp(net, dstIp);
-
-    // Same subnet -> direct delivery
-    if (sameSubnet(si.ip, si.mask, dstIp)) {
-      if (!dst) return { ok: false, reason: 'Destination host unreachable (no ARP reply).' };
-      if (dst.dev.id === srcId) return { ok: true, via: 'local', hops: [srcId], latency: '<1' };
-      const p = pathExists(net, srcId, dst.dev.id);
-      if (!p) return { ok: false, reason: 'Destination host unreachable (no path at layer 2).' };
-      return { ok: true, via: 'local', hops: p, latency: String(1 + (p.length - 2)) };
-    }
-
-    // Off-subnet -> needs a working default gateway
-    if (!isValidIp(si.gateway)) {
-      return { ok: false, reason: 'General failure — no default gateway configured, destination is on a remote subnet.' };
-    }
-    if (!sameSubnet(si.ip, si.mask, si.gateway)) {
-      return { ok: false, reason: 'Default gateway ' + si.gateway + ' is not on the local subnet ' + networkOf(si.ip, si.mask) + '/' + si.mask + '.' };
-    }
+  function isReachable(net, srcId, dstIp) {
+    if (!net || !net.devices) return false;
+    const src = net.devices[srcId]; if (!src) return false;
+    const si = Object.values(src.ifaces)[0]; if (!si || !si.up || !isValidIp(si.ip)) return false;
+    if (sameSubnet(si.ip, si.mask, dstIp)) { const found = findDeviceByIp(net, dstIp); return !!(found && found.iface.up); }
+    if (!isValidIp(si.gateway) || !sameSubnet(si.ip, si.mask, si.gateway)) return false;
     const gw = findDeviceByIp(net, si.gateway);
-    if (!gw) return { ok: false, reason: 'Destination host unreachable (gateway address has no ARP reply).' };
-    if (!pathExists(net, srcId, gw.dev.id)) {
-      return { ok: false, reason: 'Destination host unreachable (gateway is not reachable at layer 2).' };
-    }
-    if (!dst) return { ok: false, reason: 'Request timed out (no route to destination network).' };
-    const p2 = pathExists(net, gw.dev.id, dst.dev.id);
-    if (!p2) return { ok: false, reason: 'Destination net unreachable (the router has no route or the far interface is down).' };
-    const hops = [srcId].concat(p2);
-    return { ok: true, via: 'gateway', hops, latency: String(1 + (hops.length - 2) * 2) };
+    return !!(gw && gw.iface.up);
   }
 
-  function isReachable(net, srcId, dstIp) { return reach(net, srcId, dstIp).ok; }
-
-  /* ---------- tracert ---------- */
-  function traceRoute(net, srcId, dstIp) {
-    const r = reach(net, srcId, dstIp);
-    if (!r.ok) return { ok: false, reason: r.reason, hops: [] };
-    return { ok: true, hops: r.hops.map(id => net.devices[id].name), latency: r.latency };
-  }
-
-  /* ---------- dns ---------- */
-  function resolve(net, srcId, name) {
-    const src = net.devices[srcId];
-    if (!src) return { ok: false, reason: 'Unknown device.' };
-    const si = primaryIf(src);
-    if (!si) return { ok: false, reason: 'Device has no network interface.' };
-    if (!si.up) return { ok: false, reason: 'Media disconnected.' };
-    if (!isValidIp(si.dns)) return { ok: false, reason: 'No DNS server is configured on this interface.' };
-
-    const dnsDev = findDeviceByIp(net, si.dns);
-    const r = reach(net, srcId, si.dns);
-    if (!dnsDev || !r.ok) {
-      return { ok: false, reason: 'DNS request timed out.\n    timeout was 2 seconds.\n    Server:  ' + si.dns + '\n    *** Request to ' + si.dns + ' timed out.', dns: si.dns };
-    }
-    const rec = net.dns && net.dns[name.toLowerCase()];
-    if (!rec) {
-      return { ok: false, reason: 'Server:  ' + si.dns + '\n    *** ' + si.dns + " can't find " + name + ': Non-existent domain', dns: si.dns };
-    }
-    return { ok: true, ip: rec, dns: si.dns, server: dnsDev.dev.name };
-  }
-
-  /* ---------- arp table ---------- */
-  function arpTable(net, srcId) {
-    const src = net.devices[srcId];
-    const si = primaryIf(src);
-    if (!si || !si.ip || !isValidIp(si.ip)) return [];
-    const rows = [];
-    for (const id in net.devices) {
-      if (id === srcId) continue;
-      const d = net.devices[id];
-      for (const n of ifaceNames(d)) {
-        const i = d.ifaces[n];
-        if (!i.ip || !i.up || !sameSubnet(si.ip, si.mask, i.ip)) continue;
-        if (!pathExists(net, srcId, id)) continue;
-        rows.push({ ip: i.ip, mac: fakeMac(id + n), iface: n });
-      }
-    }
-    return rows;
-  }
-  function fakeMac(seed) {
-    let h = 0;
-    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-    const b = [0x02, (h >>> 24) & 255, (h >>> 16) & 255, (h >>> 8) & 255, h & 255, (h * 7) & 255];
-    return b.map(x => x.toString(16).padStart(2, '0')).join(':').toUpperCase();
-  }
-
-  /* ---------- terminal command engine ---------- */
-  /**
-   * exec(cmd, ctx) -> { lines:[{text,cls}], flags:{}, clear:bool, event?:{} }
-   * ctx = { net, activeDeviceId, mission, run }
-   */
   function exec(raw, ctx) {
-    const out = [];
-    const push = (text, cls) => out.push({ text: String(text), cls: cls || '' });
-    const cmdline = String(raw || '').trim();
-    if (!cmdline) return { lines: out };
-
-    const parts = cmdline.split(/\s+/);
-    const cmd = parts[0].toLowerCase();
-    const args = parts.slice(1);
-    const flags = {};
-    const net = ctx.net;
-    const devId = ctx.activeDeviceId;
-    const dev = net.devices[devId];
-    const allowed = (ctx.mission.terminal && ctx.mission.terminal.commands) || [];
-
-    function deny() {
-      push("'" + cmd + "' is not available in this mission context.", 'err');
-      push('Type "help" for the command list.', 'sys');
-      return true;
+    // Real-world syntax is interpreted by a safe browser-only command engine first.
+    // Unknown commands fall through to the existing CyberOps mission/enterprise commands.
+    if (window.CommandLab && typeof window.CommandLab.exec === 'function') {
+      const labResult = window.CommandLab.exec(raw, ctx);
+      if (labResult) return labResult;
     }
-    if (allowed.length && allowed.indexOf(cmd) === -1) return { lines: out, denied: true };
+    const parts = raw.trim().split(/\s+/); const cmd = parts[0].toLowerCase(); const args = parts.slice(1);
+    const lines = []; const flags = {}; const push = (text, cls) => lines.push({ text, cls: cls || '' });
+    const net = ctx.net, activeId = ctx.activeDeviceId, run = ctx.run;
 
     switch (cmd) {
-      case 'help': {
-        push('Available commands:', 'sys');
-        allowed.forEach(c => push('  ' + c + '   — ' + HELP[c], ''));
-        push('', '');
-        push('All output is generated by a fictional simulator. No real traffic is produced.', 'sys');
-        break;
-      }
-      case 'clear':
-        return { lines: out, clear: true };
-
-      case 'ipconfig': {
-        flags['cmd:ipconfig'] = true;
-        const target = args[0] ? resolveDevice(net, args[0]) : dev;
-        if (!target) { push('No device matches "' + args[0] + '".', 'err'); break; }
-        push('Windows IP Configuration — ' + target.name, 'sys');
-        push('');
-        ifaceNames(target).forEach(n => {
-          const i = target.ifaces[n];
-          if (!i.ip) { push('  ' + n + ': (no IP — layer 2 port, state ' + (i.up ? 'UP' : 'DOWN') + ')'); return; }
-          push('Ethernet adapter ' + n + ':');
-          push('   Media State . . . . . . . . . : ' + (i.up ? 'Connected' : 'Media disconnected'));
-          push('   IPv4 Address. . . . . . . . . : ' + i.ip);
-          push('   Subnet Mask . . . . . . . . . : ' + i.mask);
-          push('   Default Gateway . . . . . . . : ' + (i.gateway || '(none)'));
-          push('   DNS Servers . . . . . . . . . : ' + (i.dns || '(none)'));
-          push('');
-        });
-        break;
-      }
-
-      case 'ping': {
-        if (!args[0]) { push('Usage: ping <ip-or-hostname>', 'err'); break; }
-        const target = args[0];
-        let ip = target, nameNote = '';
-        if (!isValidIp(target)) {
-          const res = resolve(net, devId, target);
-          if (!res.ok) { push('Ping request could not find host ' + target + '. Please check the name and try again.', 'err'); break; }
-          ip = res.ip; nameNote = ' [' + ip + ']';
-        }
-        flags['ping:' + ip] = true;
-        push('Pinging ' + ip + nameNote + ' with 32 bytes of data:', '');
-        const r = reach(net, devId, ip);
-        if (!r.ok) {
-          for (let k = 0; k < 4; k++) push('Request timed out.', 'err');
-          push('');
-          push(r.reason, 'warn');
-          break;
-        }
-        const lat = Number(r.latency) || 1;
-        for (let k = 0; k < 4; k++) push('Reply from ' + ip + ': bytes=32 time=' + (lat + k) + 'ms TTL=' + (128 - r.hops.length), 'ok');
-        push('');
-        push('Ping statistics for ' + ip + ':');
-        push('    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),', 'ok');
-        push('Approximate round trip times: Minimum = ' + lat + 'ms, Maximum = ' + (lat + 3) + 'ms, Average = ' + lat + 'ms');
-        break;
-      }
-
-      case 'tracert': {
-        if (!args[0]) { push('Usage: tracert <ip>', 'err'); break; }
-        const r = traceRoute(net, devId, args[0]);
-        push('Tracing route to ' + args[0] + ' over a maximum of 30 hops:', '');
-        if (!r.ok) { push('Unable to resolve target system name ' + args[0] + '.', 'err'); push(r.reason, 'warn'); break; }
-        r.hops.forEach((n, i) => push('  ' + (i + 1) + '    ' + (1 + i) + ' ms   ' + n, 'ok'));
-        push('');
-        push('Trace complete.', 'sys');
-        break;
-      }
-
+      case 'help': push('Mission tools: ' + (ctx.mission.terminal.commands || []).join(', '), 'sys'); push('Real-syntax lab: commands, connect <device>, ipconfig /all, ip addr, ip route, ping <IP>, tracert <IP>, nslookup <name>, dig <name>, arp -a, netstat -ano, ss -tuln, nmap -sV <in-scope-IP>, grep <text>, sha256sum <file>, show ip interface brief, show ip route, show vlan brief, show running-config, configure terminal, interface <name>, shutdown, no shutdown, vlan <id>, switchport access vlan <id>, write memory.', 'sys'); push('Enterprise tools: company, whoami, services, service <start|stop|restart> <name>, verify <service>, network, devices, device <ID>, device set <ID> <up|down>, diagnose <service>, logs, scenario start <ticketID>, tickets, ticket <ID>, ticket update <ID> <investigating|open|pending>, resolve <ticketID>, changes, change record <summary>, history, route, netstat, tracert <IPv4>, arp -a', 'sys'); push('All commands operate only on this fictional training environment.', 'warn'); break;
+      case 'clear': return { clear: true };
+      case 'ipconfig':
+        if (!net || !net.devices) { push('No network interfaces found.', 'err'); break; }
+        const d = net.devices[activeId] || net.devices[ctx.mission.terminal.device];
+        if (d) { const i = Object.values(d.ifaces)[0]; push(`IPv4: ${i.ip || 'none'} | Mask: ${i.mask || 'none'} | GW: ${i.gateway || 'none'} | DNS: ${i.dns || 'none'}`, 'sys'); }
+        flags['cmd:ipconfig'] = true; break;
+      case 'ping':
+        if (!args[0]) { push('Usage: ping <IPv4 address>', 'warn'); break; }
+        if (isReachable(net, activeId || ctx.mission.terminal.device, args[0])) { push('Reply from ' + args[0] + ': bytes=32 time=1ms TTL=128', 'ok'); flags['ping:' + args[0]] = true; }
+        else push('Request timed out.', 'err'); break;
       case 'nslookup': {
-        if (!args[0]) { push('Usage: nslookup <hostname>', 'err'); break; }
-        flags['cmd:nslookup'] = true;
-        const r = resolve(net, devId, args[0]);
-        if (!r.ok) { push(r.reason, 'err'); break; }
-        push('Server:  ' + r.server, '');
-        push('Address:  ' + r.dns, '');
-        push('');
-        push('Non-authoritative answer:');
-        push('Name:    ' + args[0], 'ok');
-        push('Address: ' + r.ip, 'ok');
+        const name = args[0];
+        if (!name) { push('Usage: nslookup <host name>', 'warn'); break; }
+        const dnsDevice = net && net.devices && (net.devices[activeId] || net.devices[ctx.mission.terminal.device]);
+        const dnsIface = dnsDevice && Object.values(dnsDevice.ifaces)[0];
+        const approved = run.dnsRecords && run.dnsRecords[name];
+        if (!dnsIface || !dnsIface.dns) push('No DNS resolver configured.', 'err');
+        else if (run.approvedDns && dnsIface.dns !== run.approvedDns) push(`Server: ${dnsIface.dns}\nDNS request timed out. Check the configured resolver.`, 'err');
+        else if (approved) { push(`Server: ${dnsIface.dns}\nName: ${name}\nAddress: ${approved}`, 'ok'); flags['nslookup:' + name] = true; }
+        else push(`Server: ${dnsIface.dns}\n*** No record found for ${name}`, 'warn');
         break;
       }
-
-      case 'arp': {
-        flags['cmd:arp'] = true;
-        push('Interface: ' + (primaryIf(dev).ip || '—'), 'sys');
-        push('  Internet Address      Physical Address      Type');
-        const rows = arpTable(net, devId);
-        if (!rows.length) { push('  (no entries — no neighbours responded)', 'sys'); break; }
-        rows.forEach(r => push('  ' + r.ip.padEnd(22) + r.mac.padEnd(22) + 'dynamic'));
+      case 'whoami': {
+        const p = window.Game && window.Game.get && window.Game.get();
+        push(`Operator: ${p ? p.username : 'Guest'} | Career: ${p ? p.careerPath : 'none'} | Rank: ${p ? window.Game.rankFor(p.xp, p.careerPath) : 'unassigned'}`, 'sys');
         break;
       }
-
+      case 'company': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        const up = Object.values(e.services).filter(v => v === 'up').length;
+        push('CYBEROPS DEMO ENTERPRISE | simulated service health: ' + up + '/' + Object.keys(e.services).length + ' online', up === Object.keys(e.services).length ? 'ok' : 'warn');
+        push('Open tickets: ' + e.tickets.filter(t => t.status !== 'CLOSED').length + ' | Change records: ' + e.changes.length + ' | Audit events: ' + e.events.length, 'sys');
+        flags['cmd:company'] = true; break;
+      }
+      case 'services': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        Object.entries(e.services).forEach(([name, status]) => {
+          const health = window.Game.serviceHealth ? window.Game.serviceHealth(name) : { ok: status === 'up' };
+          push(`${name.padEnd(14)} ${status.toUpperCase()}${e.verified[name] ? ' · VERIFIED' : ''}${!health.ok && health.issues ? ' · DEPENDENCY FAULT' : ''}`, health.ok ? 'ok' : 'err');
+        });
+        flags['cmd:services'] = true; break;
+      }
+      case 'network':
+      case 'devices': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        push('SIMULATED ENTERPRISE TOPOLOGY · NOT TO SCALE', 'sys');
+        e.devices.forEach(d => push(`${d.id.padEnd(8)} ${d.ip.padEnd(15)} ${d.name} | ${d.segment} | ${d.status.toUpperCase()}`, d.status === 'up' ? 'ok' : 'err'));
+        push('Segments: USER-LAN → EDGE → SERVER-LAN; SECURITY-LAN receives monitoring events.', 'sys');
+        flags['cmd:network'] = true; break;
+      }
+      case 'device': {
+        const game = window.Game; const e = game && game.getEnterpriseState && game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        if ((args[0] || '').toLowerCase() === 'set') {
+          const result = game.setEnterpriseDevice && game.setEnterpriseDevice((args[1] || '').toLowerCase(), (args[2] || '').toLowerCase());
+          if (result && result.ok) { push(`${result.device.id} changed from ${result.previous} to ${result.status}.`, result.status === 'up' ? 'ok' : 'warn'); flags['device:' + result.device.id + ':' + result.status] = true; }
+          else push(result && result.message || 'Usage: device set <ID> <up|down>', 'err'); break;
+        }
+        const d = e.devices.find(x => x.id.toLowerCase() === String(args[0] || '').toLowerCase());
+        if (!d) { push('Usage: device <ID> or device set <ID> <up|down>. Run devices to list IDs.', 'warn'); break; }
+        push(`${d.name} (${d.id})`, 'sys'); push(`Type: ${d.type} | IP: ${d.ip} | Segment: ${d.segment} | Status: ${d.status.toUpperCase()}`, d.status === 'up' ? 'ok' : 'err'); flags['device:' + d.id] = true; break;
+      }
+      case 'diagnose': {
+        const name = (args[0] || '').toLowerCase();
+        const result = window.Game && window.Game.getEnterpriseDiagnosis && window.Game.getEnterpriseDiagnosis(name);
+        if (!result || !result.ok) { push(result && result.message || 'Usage: diagnose <intranet|dns|vpn|file-share|monitoring>', 'err'); break; }
+        push(`Diagnostic report: ${result.service}`, 'sys');
+        result.dependencies.forEach(dep => push(`${dep.name.padEnd(20)} ${String(dep.status).toUpperCase()}`, dep.status === 'up' ? 'ok' : 'err'));
+        if (result.healthy) push('No current dependency fault detected. Confirm with verification and relevant logs.', 'ok');
+        else result.issues.forEach(issue => push('Finding: ' + issue, 'warn'));
+        flags['diagnose:' + name] = true; break;
+      }
+      case 'scenario': {
+        if ((args[0] || '').toLowerCase() !== 'start' || !args[1]) { push('Usage: scenario start <ticketID> (try INC-105)', 'warn'); break; }
+        const result = window.Game && window.Game.startEnterpriseScenario && window.Game.startEnterpriseScenario(args[1]);
+        if (result && result.ok) { push(result.message, 'ok'); flags['scenario:' + args[1].toUpperCase()] = true; }
+        else push(result && result.message || 'Scenario engine unavailable.', 'err'); break;
+      }
+      case 'service': {
+        const action = (args[0] || '').toLowerCase(), name = (args[1] || '').toLowerCase();
+        if (!['start','stop','restart'].includes(action) || !name) { push('Usage: service <start|stop|restart> <intranet|dns|vpn|file-share|monitoring>', 'warn'); break; }
+        const game = window.Game;
+        if (!game || !game.getEnterpriseState) { push('Enterprise simulator unavailable.', 'err'); break; }
+        if (action === 'stop') {
+          const result = game.setEnterpriseService(name, 'down');
+          if (result.ok) { push(`${name} stopped in the fictional lab. Availability is now affected.`, 'warn'); flags['service:' + name + ':down'] = true; }
+          else push(result.message, 'err');
+        } else {
+          const result = game.setEnterpriseService(name, 'up');
+          if (result.ok) { push(`${name} ${action === 'restart' ? 'restarted' : 'started'} in the fictional lab. Run verify ${name} to check it.`, 'ok'); flags['service:' + name + ':up'] = true; }
+          else push(result.message, 'err');
+        }
+        break;
+      }
+      case 'verify': {
+        const name = (args[0] || '').toLowerCase();
+        if (!name) { push('Usage: verify <service-name>', 'warn'); break; }
+        const result = window.Game && window.Game.verifyEnterpriseService && window.Game.verifyEnterpriseService(name);
+        if (!result || !result.ok && !result.status) push(result && result.message || 'Verification unavailable.', 'err');
+        else if (result.ok) { push(`Verification passed: ${name} is UP.`, 'ok'); flags['verify:' + name] = true; }
+        else { push(`Verification failed: ${name} is DOWN. Restore it, then verify again.`, 'err'); flags['verify:' + name] = false; }
+        break;
+      }
+      case 'tickets': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        e.tickets.forEach(t => push(`${t.id} [${t.priority}] ${t.status} · ${t.team} · ${t.title}`, t.priority === 'HIGH' ? 'warn' : 'sys'));
+        flags['cmd:tickets'] = true; break;
+      }
+      case 'ticket': {
+        if ((args[0] || '').toLowerCase() === 'update') {
+          const result = window.Game && window.Game.updateEnterpriseTicket && window.Game.updateEnterpriseTicket(args[1], String(args[2] || '').toUpperCase());
+          if (result && result.ok) { push(`${result.ticket.id} status updated to ${result.ticket.status}.`, 'ok'); flags['ticket:' + result.ticket.id] = true; }
+          else push(result && result.message || 'Usage: ticket update <ID> <investigating|open|pending>', 'err'); break;
+        }
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        const t = e && e.tickets.find(x => x.id.toLowerCase() === String(args[0] || '').toLowerCase());
+        if (t) { push(`${t.id}: ${t.title}`, 'sys'); push(`Priority: ${t.priority} | Status: ${t.status} | Assigned team: ${t.team}`, 'sys'); if (t.scenario) push(`Playable scenario: scenario start ${t.id}`, 'sys'); if (t.resolution) push(`Resolution: ${t.resolution}`, 'ok'); flags['ticket:' + t.id] = true; }
+        else push('Ticket not found. Run tickets to list fictional tickets.', 'err');
+        break;
+      }
+      case 'resolve': {
+        const result = window.Game && window.Game.resolveEnterpriseTicket && window.Game.resolveEnterpriseTicket(args[0]);
+        if (result && result.ok) { push(`${result.ticket.id} resolved and closed.`, 'ok'); push(`Resolution: ${result.ticket.resolution}`, 'sys'); flags['resolved:' + result.ticket.id] = true; }
+        else push(result && result.message || 'Usage: resolve <ticketID>', 'err'); break;
+      }
+      case 'changes': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        if (!e.changes.length) push('No change records yet. Use: change record <summary>', 'sys');
+        e.changes.slice(0, 10).forEach(c => push(`${c.id} | ${new Date(c.at).toLocaleString()} | ${c.summary} | by ${c.by}`, 'sys'));
+        flags['cmd:changes'] = true; break;
+      }
+      case 'change': {
+        if ((args[0] || '').toLowerCase() !== 'record' || args.length < 2) { push('Usage: change record <short summary of the change>', 'warn'); break; }
+        const record = window.Game && window.Game.addChangeRecord && window.Game.addChangeRecord(args.slice(1).join(' '));
+        if (record) { push(`Recorded ${record.id}: ${record.summary}`, 'ok'); flags['change:' + record.id] = true; }
+        else push('No active personnel profile.', 'err');
+        break;
+      }
+      case 'history': {
+        const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+        if (!e) { push('No active personnel profile.', 'err'); break; }
+        if (!e.events.length) push('No enterprise audit events recorded yet.', 'sys');
+        e.events.slice(0, 8).forEach(ev => push(`${new Date(ev.at).toLocaleTimeString()} | ${ev.category.toUpperCase()} | ${ev.action} — ${ev.detail}`, 'sys'));
+        flags['cmd:history'] = true; break;
+      }
+      case 'route': {
+        const d = net && net.devices && (net.devices[activeId] || net.devices[ctx.mission.terminal.device]);
+        const i = d && Object.values(d.ifaces)[0];
+        if (!i) push('No active simulated route table for this assignment.', 'warn');
+        else { push('Network Destination     Netmask          Gateway', 'sys'); push(`0.0.0.0                 0.0.0.0          ${i.gateway || 'on-link'}`, 'sys'); push(`${i.ip || '0.0.0.0'}              ${i.mask || 'unknown'}     on-link`, 'sys'); flags['cmd:route'] = true; }
+        break;
+      }
       case 'netstat': {
-        flags['cmd:netstat'] = true;
-        push('Active Connections', 'sys');
-        push('  Proto  Local Address        Foreign Address        State');
-        push('  TCP    ' + (primaryIf(dev).ip || '0.0.0.0') + ':49152   10.0.10.20:445         ESTABLISHED');
-        push('  TCP    ' + (primaryIf(dev).ip || '0.0.0.0') + ':49160   10.0.10.53:53          ESTABLISHED');
-        push('  UDP    ' + (primaryIf(dev).ip || '0.0.0.0') + ':5353    *:*');
+        push('Active simulated connections:', 'sys');
+        push('TCP 10.0.10.50:51522 10.0.10.20:443 ESTABLISHED (intranet)', 'ok');
+        push('TCP 10.0.10.50:51528 10.0.10.53:53  TIME_WAIT (dns)', 'sys');
+        push('TCP 10.0.10.50:51601 198.51.100.24:443 CLOSE_WAIT (external demo)', 'warn');
+        flags['cmd:netstat'] = true; break;
+      }
+      case 'tracert': {
+        if (!args[0] || !isValidIp(args[0])) { push('Usage: tracert <IPv4 address>', 'warn'); break; }
+        const d = net && net.devices && (net.devices[activeId] || net.devices[ctx.mission.terminal.device]);
+        const i = d && Object.values(d.ifaces)[0];
+        if (!i || !i.up) push('  1  * * * Request timed out.', 'err');
+        else if (sameSubnet(i.ip, i.mask, args[0])) { push(`  1  1 ms  ${args[0]}  (same subnet)`, 'ok'); flags['tracert:' + args[0]] = true; }
+        else if (isReachable(net, activeId || ctx.mission.terminal.device, args[0])) { push(`  1  1 ms  ${i.gateway || 'gateway'}`, 'sys'); push(`  2  3 ms  ${args[0]}`, 'ok'); flags['tracert:' + args[0]] = true; }
+        else push('  1  ' + (i.gateway || '*') + '  Destination unreachable or route unavailable.', 'err');
         break;
       }
-
-      case 'status': {
-        flags['cmd:status'] = true;
-        push('NETWORK STATUS SUMMARY', 'sys');
-        push('─'.repeat(58));
-        Object.keys(net.devices).forEach(id => {
-          const d = net.devices[id];
-          const states = ifaceNames(d).map(n => {
-            const i = d.ifaces[n];
-            return n + '=' + (i.up ? 'UP' : 'DOWN');
-          });
-          const anyDown = ifaceNames(d).some(n => !d.ifaces[n].up);
-          push('  ' + d.name.padEnd(10) + (anyDown ? '⚠ ' : '✔ ') + states.join('  '), anyDown ? 'warn' : 'ok');
-        });
-        push('');
-        push('Tip: an interface in DOWN state is administratively disabled.', 'sys');
-        break;
+      case 'arp': {
+        if (args[0] !== '-a') { push('Usage: arp -a', 'warn'); break; }
+        if (!net || !net.devices) { push('No simulated ARP cache.', 'err'); break; }
+        Object.values(net.devices).forEach(dev => { const iface = Object.values(dev.ifaces)[0]; if (iface.ip) push(`${iface.ip}  dynamic  02-00-5E-${String(dev.id.length).padStart(2,'0')}-10-01  ${dev.name}`, 'sys'); });
+        flags['cmd:arp'] = true; break;
       }
-
-      case 'alerts': {
-        flags['cmd:alerts'] = true;
-        const list = (ctx.run.alerts || []);
-        push('SECURITY ALERT QUEUE — ' + list.length + ' open', 'sys');
-        push('─'.repeat(72));
-        list.forEach(a => {
-          const sev = a.severity === 'high' ? 'sev-high' : a.severity === 'medium' ? 'sev-med' : 'sev-low';
-          push(a.id + '  [' + a.severity.toUpperCase() + ']  ' + a.ts + '  ' + a.title, sev);
-          push('     src=' + a.src + '  status=' + a.status + '  —  run "inspect ' + a.id + '" for details', 'sys');
-        });
-        break;
-      }
-
-      case 'inspect': {
-        if (!args[0]) { push('Usage: inspect <alert-id | host | ip>', 'err'); break; }
-        const q = args[0];
-        flags['inspect:' + q] = true;
-        const alert = (ctx.run.alerts || []).find(a => a.id.toLowerCase() === q.toLowerCase());
-        if (alert) {
-          push('ALERT ' + alert.id, 'sys');
-          push('─'.repeat(58));
-          push('Title      : ' + alert.title);
-          push('Severity   : ' + alert.severity.toUpperCase());
-          push('Timestamp  : ' + alert.ts);
-          push('Source     : ' + alert.src);
-          push('Status     : ' + alert.status);
-          push('');
-          push('Description:');
-          push(alert.detail, '');
-          if (alert.related && alert.related.length) {
-            push('');
-            push('Related events:');
-            alert.related.forEach(r => push('  • ' + r, 'sys'));
-          }
-          break;
-        }
-        const host = (ctx.run.hosts || []).find(h => h.ip === q || (h.host || '').toLowerCase() === q.toLowerCase());
-        if (host) {
-          push('HOST ' + host.ip + '  (' + host.host + ')', 'sys');
-          push('─'.repeat(58));
-          push('OS         : ' + host.os);
-          push('Open ports :');
-          host.ports.forEach(p => push('  ' + String(p.port).padEnd(7) + p.svc + '   ' + (p.note || '')));
-          if (host.findings && host.findings.length) {
-            push('');
-            push('Observed weaknesses:');
-            host.findings.forEach(f => push('  ⚠ ' + f, 'warn'));
-          }
-          break;
-        }
-        push('Nothing matching "' + q + '" was found in the current evidence set.', 'err');
-        break;
-      }
-
-      case 'scan': {
-        if (!args[0]) { push('Usage: scan <cidr | ip>  (authorised lab range only)', 'err'); break; }
-        flags['cmd:scan'] = true;
-        const hosts = (ctx.run.hosts || []);
-        const prefix = args[0].split('/')[0].split('.').slice(0, 3).join('.');
-        const inRange = hosts.filter(h => h.ip.startsWith(prefix + '.'));
-        if (!inRange.length) { push('No hosts responded in ' + args[0] + '.', 'err'); break; }
-        push('Starting authorised discovery scan against ' + args[0], 'sys');
-        push('(simulated — no packets leave this browser)', 'sys');
-        push('');
-        inRange.forEach(h => {
-          push('Host ' + h.ip + ' is up   (' + h.host + ')', 'ok');
-          h.ports.forEach(p => push('  ' + String(p.port).padEnd(6) + 'open   ' + p.svc));
-          flags['discovered:' + h.ip] = true;
-        });
-        push('');
-        push(inRange.length + ' host(s) discovered.', 'sys');
-        break;
-      }
-
+      case 'status':
+        if (!net || !net.devices) { push('No network devices found.', 'err'); break; }
+        Object.values(net.devices).forEach(d => push(`${d.name}: ${Object.values(d.ifaces)[0].up ? 'UP' : 'DOWN'}`, Object.values(d.ifaces)[0].up ? 'ok' : 'err'));
+        flags['cmd:status'] = true; break;
+      case 'alerts':
+        (run.alerts || []).forEach(a => push(`[${a.severity.toUpperCase()}] ${a.id} - ${a.title} (src: ${a.src})`, a.severity === 'high' ? 'err' : 'warn'));
+        flags['cmd:alerts'] = true; break;
       case 'logs': {
-        flags['cmd:logs'] = true;
-        const filter = (args[0] || '').toLowerCase();
-        const logs = (ctx.run.logs || []);
-        push('EVENT LOG  (' + (filter ? 'filter="' + filter + '"' : 'all sources') + ')', 'sys');
-        push('─'.repeat(78));
-        let shown = 0;
-        logs.forEach(l => {
-          const hay = (l.ts + ' ' + l.host + ' ' + l.user + ' ' + l.event + ' ' + l.src + ' ' + (l.note || '')).toLowerCase();
-          if (filter && hay.indexOf(filter) === -1) return;
-          shown++;
-          push(l.ts + '  ' + String(l.host).padEnd(9) + String(l.event).padEnd(16) +
-               'user=' + String(l.user || '-').padEnd(10) + 'src=' + l.src + (l.note ? '  ' + l.note : ''),
-               l.suspicious ? 'warn' : '');
-        });
-        if (!shown) push('  No matching events.', 'sys');
+        if (ctx.enterpriseConsole) {
+          const e = window.Game && window.Game.getEnterpriseState && window.Game.getEnterpriseState();
+          if (!e || !e.logs.length) push('No enterprise events recorded.', 'sys');
+          else e.logs.slice(0, 12).forEach(l => push(`${new Date(l.at).toLocaleTimeString()} | ${l.severity} | ${l.host} | ${l.event} — ${l.detail}`, l.severity === 'WARN' || l.severity === 'ERROR' ? 'warn' : 'sys'));
+        } else (run.logs || []).forEach(l => push(`${l.ts} | ${l.host} | ${l.event} | user=${l.user} | src=${l.src}`, l.suspicious ? 'warn' : 'sys'));
+        flags['cmd:logs'] = true; break;
+      }
+      case 'inspect':
+        const alert = (run.alerts || []).find(a => a.id === args[0]);
+        if (alert) { push(`ALERT ${alert.id}: ${alert.detail}`, 'sys'); flags['inspect:' + args[0]] = true; }
+        else push('Target not found.', 'err'); break;
+      case 'scan':
+        (run.hosts || []).forEach(h => { push(`Host ${h.ip} is up (${h.host})`, 'ok'); flags['discovered:' + h.ip] = true; });
+        flags['cmd:scan'] = true; break;
+      case 'osint': push('OSINT complete. Found hash: 5f4dcc3b5aa765d61d8327deb882cf99', 'ok'); flags['cmd:osint'] = true; break;
+      case 'crack':
+        if (args[0] === '5f4dcc3b5aa765d61d8327deb882cf99') { push('Password cracked: admin123', 'ok'); flags['cmd:crack'] = true; }
+        else push('Hash not recognized.', 'err'); break;
+      case 'exploit': {
+        const target = args[0];
+        const inScope = target && (run.hosts || []).some(h => h.ip === target);
+        if (!target) push('Usage: exploit <in-scope lab IPv4 address>', 'warn');
+        else if (!inScope) push("SCOPE BLOCK: target is not listed in this mission's authorised lab scope.", 'err');
+        else if (!run.flags['discovered:' + target]) push('Pre-check required: run the simulated scan and verify the target is in scope first.', 'warn');
+        else { push(`Simulated validation succeeded against in-scope lab host ${target}. Record the finding and remediation.`, 'ok'); flags['exploited:' + target] = true; }
         break;
       }
-
-      case 'report': {
-        flags['cmd:report'] = true;
-        push('Opening the findings report panel…', 'sys');
-        return { lines: out, event: { type: 'open-report' } };
-      }
-
-      default:
-        push("'" + cmd + "' is not recognized as a command.", 'err');
-        push('Type "help" for the list of available commands.', 'sys');
+      default: push('Unknown command.', 'err');
     }
-    return { lines: out, flags };
+    return { lines, flags };
   }
-
-  function resolveDevice(net, token) {
-    const t = String(token).toLowerCase();
-    for (const id in net.devices) {
-      const d = net.devices[id];
-      if (id.toLowerCase() === t || d.name.toLowerCase() === t) return d;
-    }
-    return null;
-  }
-
-  const HELP = {
-    help: 'show this list',
-    clear: 'clear the terminal',
-    ipconfig: 'show interface configuration',
-    ping: 'test reachability to an address or name',
-    tracert: 'show the simulated path to a destination',
-    nslookup: 'query the simulated DNS server',
-    arp: 'display the neighbour cache',
-    netstat: 'display active connections',
-    scan: 'authorised simulated discovery scan',
-    inspect: 'show details for an alert, host or IP',
-    logs: 'query the event log (optional filter)',
-    alerts: 'show the security alert queue',
-    status: 'summarise device and interface state',
-    report: 'open the findings report panel'
-  };
-
-  return {
-    isValidIp, ipToInt, intToIp, sameSubnet, networkOf,
-    iface, ifaceNames, primaryIf, findDeviceByIp,
-    pathExists, reach, isReachable, traceRoute, resolve, arpTable,
-    exec, HELP
-  };
+  return { isValidIp, sameSubnet, isReachable, exec };
 })();

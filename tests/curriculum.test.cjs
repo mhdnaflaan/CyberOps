@@ -1,0 +1,6 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const store={};const ctx={window:{},localStorage:{getItem:k=>store[k]||null,setItem:(k,v)=>store[k]=v},Date,JSON};vm.createContext(ctx);vm.runInContext(fs.readFileSync(__dirname+'/../js/curriculum.js','utf8'),ctx);
+const api=ctx.window.CareerCurriculum;assert(api,'CareerCurriculum exported');assert.equal(api.paths.length,6,'six career paths');
+const expected=['network','soc','pentest','web','linux','dfir'];assert.deepEqual(Array.from(api.paths,p=>p.id),expected);
+for(const p of api.paths){assert.equal(p.modules.length,8,`${p.id} has eight progressive modules`);for(const m of p.modules){assert(m.title&&m.lesson&&m.practical&&m.concepts.length>=4&&m.options.length>=3&&m.explanation,`${m.id} has complete lesson content`);assert(m.correct>=0&&m.correct<m.options.length,`${m.id} quiz answer valid`);}}
+let p=api.paths.find(p=>p.id==='network'),m=p.modules[0];assert.equal(api.isComplete(m.id),false);let a=api.answer(m.id,m.correct,(m.correct+1)%m.options.length);assert.equal(a.correct,false);a=api.answer(m.id,m.correct,m.correct);assert.equal(a.correct,true);api.complete(m.id);assert.equal(api.isComplete(m.id),true);assert.equal(api.getProgress().completed.length,1);console.log('Career curriculum tests passed: 6 paths, 48 lessons, valid quizzes and persistence.');
